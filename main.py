@@ -174,6 +174,150 @@ class DeviceTile(QFrame):
             self.screen.setToolTip(text)
 
 
+class InputOverlay(QWidget):
+    """Widget overlay that captures mouse and keyboard events on top of a tile.
+    It injects input to the associated device via ADB and, if this tile is the Leader,
+    forwards inputs to selected follower devices.
+    """
+    def __init__(self, parent_widget, serial, main_window):
+        super().__init__(parent_widget)
+        self.serial = serial
+        self.main = main_window
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.pressed = False
+        self.start_pos = None
+        self.resize(parent_widget.size())
+        self.show()
+
+    def resizeEvent(self, ev):
+        self.resize(self.parent().size())
+
+    def mousePressEvent(self, ev):
+        self.pressed = True
+        self.start_pos = ev.position() if hasattr(ev, 'position') else ev.pos()
+        self.setFocus()
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        if not self.pressed:
+            return
+        self.pressed = False
+        end_pos = ev.position() if hasattr(ev, 'position') else ev.pos()
+        w = self.width()
+        h = self.height()
+        sx, sy = (self.start_pos.x(), self.start_pos.y())
+        ex, ey = (end_pos.x(), end_pos.y())
+        dx = ex - sx
+        dy = ey - sy
+        dist = (dx * dx + dy * dy) ** 0.5
+        dev = self.main.devices.get(self.serial)
+        if not dev:
+            return
+        # Get device physical size
+        size = (dev.screen_w, dev.screen_h)
+        if not size or size[0] == 0 or size[1] == 0:
+            size = self.main.adb.get_size(self.serial)
+            if size:
+                dev.screen_w, dev.screen_h = size
+        if not size:
+            # cannot forward without device size
+            return
+        # convert coords to device space
+        x1 = int(sx / w * dev.screen_w)
+        y1 = int(sy / h * dev.screen_h)
+        x2 = int(ex / w * dev.screen_w)
+        y2 = int(ey / h * dev.screen_h)
+        if dist < 6.0:
+            # treat as tap
+            self._send_tap(self.serial, x2, y2)
+        else:
+            duration = int(min(1000, max(50, dist * 2)))
+            self._send_swipe(self.serial, x1, y1, x2, y2, duration)
+        # If this serial is leader, forward to followers
+        if self.main.leader_serial == self.serial:
+            for s, d in self.main.devices.items():
+                if s == self.serial:
+                    continue
+                if not d.selected:
+                    continue
+                # get follower size
+                fsize = (d.screen_w, d.screen_h)
+                if not fsize or fsize[0] == 0:
+                    fsize = self.main.adb.get_size(s)
+                    if fsize:
+                        d.screen_w, d.screen_h = fsize
+                if not fsize:
+                    continue
+                # map coords proportionally
+                if dist < 6.0:
+                    fx = int(ex / w * d.screen_w)
+                    fy = int(ey / h * d.screen_h)
+                    self._send_tap(s, fx, fy)
+                else:
+                    fx1 = int(sx / w * d.screen_w)
+                    fy1 = int(sy / h * d.screen_h)
+                    fx2 = int(ex / w * d.screen_w)
+                    fy2 = int(ey / h * d.screen_h)
+                    fduration = int(min(1000, max(50, dist * 2)))
+                    self._send_swipe(s, fx1, fy1, fx2, fy2, fduration)
+        ev.accept()
+
+    def keyPressEvent(self, ev):
+        text = ev.text()
+        if text:
+            # send text to this device
+            self._send_text(self.serial, text)
+            # if leader, forward text to followers
+            if self.main.leader_serial == self.serial:
+                for s, d in self.main.devices.items():
+                    if s == self.serial or not d.selected:
+                        continue
+                    self._send_text(s, text)
+        else:
+            # special keys
+            key = ev.key()
+            if key == Qt.Key.Key_Backspace:
+                cmd = "input keyevent 67"
+            elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+                cmd = "input keyevent 66"
+            else:
+                cmd = None
+            if cmd:
+                self.main.adb.shell(self.serial, cmd)
+                if self.main.leader_serial == self.serial:
+                    for s, d in self.main.devices.items():
+                        if s == self.serial or not d.selected:
+                            continue
+                        self.main.adb.shell(s, cmd)
+        ev.accept()
+
+    def _send_tap(self, serial, x, y):
+        try:
+            self.main.adb.shell(serial, f"input tap {x} {y}")
+        except Exception:
+            pass
+
+    def _send_swipe(self, serial, x1, y1, x2, y2, duration):
+        try:
+            self.main.adb.shell(serial, f"input swipe {x1} {y1} {x2} {y2} {duration}")
+        except Exception:
+            pass
+
+    def _send_text(self, serial, text):
+        # escape spaces and special characters roughly
+        esc = text.replace(' ', '%s')
+        try:
+            self.main.adb.shell(serial, f"input text \"{esc}\"")
+        except Exception:
+            pass
+
+
 class WinApi:
     @staticmethod
     def find_window_by_title(title):
@@ -223,6 +367,7 @@ class MainWindow(QMainWindow):
         self.devices: dict[str, Device] = {}
         self.leader_serial: Optional[str] = None
         self.scrcpy_path = find_tool("scrcpy.exe") or find_tool("scrcpy")
+        self.overlays: dict[str, InputOverlay] = {}
         self._build_ui()
         self.refresh_devices()
         self.timer = QTimer(self)
@@ -297,7 +442,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.scroll, 1)
 
         note = QLabel(
-            "Catatan: versi ini mencoba meng-embed jendela scrcpy ke dalam tile Qt, tetapi implementasi input Leader ke follower tetap memerlukan pengujian perangkat Android nyata di Windows 10 x64."
+            "Catatan: versi ini meng-embed jendela scrcpy ke dalam tile Qt dan menambahkan overlay input yang meneruskan perintah input ke perangkat via ADB. Leader forwarding masih perlu pengujian pada perangkat nyata."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#ffd479;padding:4px;")
@@ -327,6 +472,13 @@ class MainWindow(QMainWindow):
                         dev.process.terminate()
                     except Exception:
                         pass
+                # remove overlay if any
+                if serial in self.overlays:
+                    try:
+                        self.overlays[serial].deleteLater()
+                    except Exception:
+                        pass
+                    del self.overlays[serial]
                 del self.devices[serial]
 
         self.rebuild_grid()
@@ -357,6 +509,13 @@ class MainWindow(QMainWindow):
             tile.set_screen_text("Terhubung\n\nKlik Mirror untuk membuka layar")
             self.grid.addWidget(tile, i // columns, i % columns)
             self.tiles[dev.serial] = tile
+            # create overlay for input capture
+            try:
+                ov = InputOverlay(tile.screen, dev.serial, self)
+                ov.raise_()
+                self.overlays[dev.serial] = ov
+            except Exception:
+                pass
 
     def set_selected(self, serial, value):
         if serial in self.devices:
@@ -366,6 +525,17 @@ class MainWindow(QMainWindow):
         self.leader_serial = serial
         for d in self.devices.values():
             d.leader = d.serial == serial
+        # restart leader device with no-control if needed
+        if serial in self.devices:
+            dev = self.devices[serial]
+            if dev.process and dev.process.poll() is None:
+                # stop and restart with --no-control to allow overlay injection
+                try:
+                    dev.process.terminate()
+                except Exception:
+                    pass
+                dev.process = None
+                QTimer.singleShot(300, lambda: self.start_device(dev))
         self.rebuild_grid()
         self.info.setText(f"Leader dipilih: {serial}. Input akan diteruskan ke perangkat pengikut yang terpilih.")
 
@@ -393,11 +563,10 @@ class MainWindow(QMainWindow):
             "--max-fps", self.fps.currentText(),
             "--window-title", f"{dev.serial} - PandaMirror 20",
             "--stay-awake",
+            "--no-control",  # run scrcpy in view-only mode; input will be injected via adb
         ]
         if self.no_audio.isChecked():
             args.append("--no-audio")
-        if dev.serial != self.leader_serial:
-            args.append("--no-control")
 
         try:
             dev.process = subprocess.Popen(
@@ -406,9 +575,16 @@ class MainWindow(QMainWindow):
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
             QTimer.singleShot(600, lambda: self.attach_scrcpy_window(dev))
+            # query device size shortly after
+            QTimer.singleShot(900, lambda: self._update_device_size(dev))
         except Exception as exc:
             QMessageBox.warning(self, "Gagal menjalankan scrcpy", str(exc))
             dev.process = None
+
+    def _update_device_size(self, dev):
+        size = self.adb.get_size(dev.serial)
+        if size:
+            dev.screen_w, dev.screen_h = size
 
     def attach_scrcpy_window(self, dev):
         if dev.serial not in self.tiles:
@@ -461,4 +637,3 @@ if __name__ == "__main__":
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
-
